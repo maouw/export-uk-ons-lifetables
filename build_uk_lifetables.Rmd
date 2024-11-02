@@ -1,0 +1,148 @@
+---
+title: "Export UK Office of National Statistics Lifetables"
+author: "Altan Orhon"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: rmarkdown::github_document
+params:
+  data_url: "https://www.ons.gov.uk/file?uri=/peoplepopulationandcommunity/birthsdeathsandmarriages/lifeexpectancies/datasets/nationallifetablesunitedkingdomreferencetables/current/nltuk198020203.xlsx"
+---
+
+This notebook downloads UK Office of National Statistics Lifetables for multiple years, turns them into long format, and exports them to `TSV` and `RDS`.
+
+```{r setup, include=FALSE}
+if (!requireNamespace("rlang", quietly = TRUE)) install.packages("rlang")
+requireNamespace("rlang", quietly = TRUE)
+rlang::check_installed(c("knitr", "tidyr", "purrr", "dplyr", "cellranger", "readxl", "withr", "checkmate", "here"))
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+Download data:
+
+```{r download-data}
+data_path <- params$data_path %||% here::here("data", basename(params$data_url))
+dir.create(data_path, showWarnings = FALSE, recursive = TRUE)
+if (!file.exists(data_path)) {
+  message("Downloading data to ", data_path)
+  download.file(data_url, data_path)
+}
+```
+
+Function to load dataset from the `XLSX` file:
+
+```{r nltuk-functions}
+load_nltuk_dataset <- function(path = "data/nltuk198020203.xlsx", sheet_names = NULL, sheet_pattern = "(^[2][0-9]{3})-([2][0-9]{3})", sheet_range = cellranger::cell_limits(c(6, 1), c(NA, 6)), year_min = -Inf, year_max = Inf, ...) {
+  if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl")
+  requireNamespace("readxl", quietly = TRUE) #
+  if (is.null(sheet_names)) {
+    sheet_names <- readxl::excel_sheets(path) |>
+      purrr::keep(stringr::str_detect, sheet_pattern) |>
+      unique()
+    checkmate::assert_character(sheet_names, min.len = 1)
+    cli::cli_inform("Identified {length(sheet_names)} sheet names ({sheet_names})")
+  }
+  if (is.null(names(sheet_names))) {
+    names(sheet_names) <- as.character(sheet_names)
+  }
+  if (inherits(sheet_range, "cell_limits")) {
+    sheet_range <- rep(list(sheet_range), length(sheet_names)) |> rlang::set_names(sheet_names)
+  }
+  checkmate::assert_list(sheet_range, len = length(sheet_names))
+  res <- purrr::map2(sheet_names, sheet_range, ~ {
+    readxl::read_excel(path,
+      sheet = .x,
+      range = .y,
+      col_types = c(age = "numeric", mx = "numeric", qx = "numeric", lx = "numeric", dx = "numeric", ex = "numeric")
+    )
+  }) |>
+    dplyr::bind_rows(.id = "sheet") |>
+    dplyr::arrange(dplyr::desc(sheet), age) |>
+    tidyr::separate_wider_delim(sheet, delim = "-", names = c("y1", "y2"), cols_remove = FALSE) |>
+    dplyr::mutate(y1 = as.integer(y1), y2 = as.integer(y2))
+
+  res |>
+    dplyr::group_by(sheet) |>
+    dplyr::reframe(year = min(y1):max(y2)) |>
+    dplyr::ungroup() |>
+    dplyr::filter(year >= year_min, year <= year_max) |>
+    dplyr::left_join(res, by = "sheet", relationship = "many-to-many") |>
+    dplyr::group_by(year, age) |>
+    dplyr::arrange(dplyr::desc(year)) |>
+    # Use the most recent value for that year
+    dplyr::filter(dplyr::row_number() == 1) |>
+    dplyr::ungroup() |>
+    dplyr::arrange(year, age) |>
+    dplyr::select(-y1, -y2) |>
+    dplyr::rename(origin = sheet)
+}
+```
+
+Load the data:
+
+```{r load-data}
+# Load everything from 2004
+nltuk_df <- load_nltuk_dataset(data_path, year_min = 2004)
+```
+
+## Data Description
+
+- `mx` is the central rate of mortality (number of deaths at age `x` last
+birthday in the 3-year period to which the life table relates divided by
+the average population at that age over the same period)
+
+- `qx` is the mortality rate between age `x` and `x + 1` (probability that
+a person aged `x` exactly will die before reaching age (`x` +1))
+
+- `lx` is the number of survivors to exact age `x` of 100,000 live births
+of the same sex (who are assumed to be subject throughout their lives to
+the mortality rates experienced in the 3-year period to which the life
+table relates)
+
+- `dx` is the number dying between exact age `x` and `x + 1`, described
+similarly to `l[x]`, that is `d[x] = l[x] - l[x +1]`.
+
+- `ex` is the average period expectation of life at exact age `x`, that
+is the average number of years that those aged `x` exactly will live
+thereafter based on the mortality rates experienced in the 3-year period
+to which the life table relates.
+
+## Preview data
+
+```{r}
+head(nltuk_df)
+```
+
+## Export data
+
+Export TSV:
+
+```{r export-tsv}
+output_path_tsv <- params$output_path_tsv %||% here::here("data", paste0(tools::file_path_sans_ext(basename(data_path)), "_", paste0(range(nltuk_df$year, na.rm = TRUE), collapse = "-"), ".tsv"))
+message("Exporting TSV to ", output_path_tsv)
+dir.create(dirname(output_path_tsv), recursive = TRUE, showWarnings = FALSE)
+if (!file.exists(output_path_tsv)) {
+  message("Writing data to ", output_path_tsv)
+  write.table(nltuk_df, sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE, file = output_path_tsv)
+} else {
+  message("Data already exists at ", output_path_tsv)
+}
+```
+
+Export RDS:
+
+```{r export-rds}
+output_path_rds <- params$output_path_rds %||% here::here("data", paste0(tools::file_path_sans_ext(basename(data_path)), "_", paste0(range(nltuk_df$year, na.rm = TRUE), collapse = "-"), ".rds"))
+message("Exporting RDS to ", output_path_rds)
+dir.create(dirname(output_path_rds), recursive = TRUE, showWarnings = FALSE)
+if (!file.exists(output_path_rds)) {
+  message("Writing data to ", output_path_rds)
+  saveRDS(nltuk_df, output_path_rds)
+} else {
+  message("Data already exists at ", output_path_rds)
+}
+```
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
